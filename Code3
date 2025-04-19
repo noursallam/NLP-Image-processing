@@ -1,0 +1,126 @@
+# Install necessary libraries
+!pip install -q transformers torch torchvision pillow sentencepiece tqdm
+
+import torch
+from PIL import Image
+from transformers import (
+    BlipProcessor, BlipForConditionalGeneration,
+    Blip2Processor, Blip2ForConditionalGeneration,
+    VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer,
+    AutoProcessor, AutoModelForCausalLM,
+    MarianTokenizer, MarianMTModel
+)
+from google.colab import files
+import logging
+from tqdm import tqdm
+import time
+import gc
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
+
+# Load captioning models
+def load_models():
+    logger.info("Loading all captioning models...")
+
+    # BLIP
+    blip_proc = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+    blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
+
+    # BLIP-2
+    blip2_proc = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
+    blip2_model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b").to(device)
+
+    # ViT-GPT2
+    vit_model = VisionEncoderDecoderModel.from_pretrained("nlpconnect/vit-gpt2-image-captioning").to(device)
+    vit_processor = ViTImageProcessor.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+    vit_tokenizer = AutoTokenizer.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+
+    # Git
+    git_processor = AutoProcessor.from_pretrained("microsoft/git-base")
+    git_model = AutoModelForCausalLM.from_pretrained("microsoft/git-base").to(device)
+
+    return {
+        "blip": (blip_proc, blip_model),
+        "blip2": (blip2_proc, blip2_model),
+        "vit": (vit_processor, vit_tokenizer, vit_model),
+        "git": (git_processor, git_model)
+    }
+
+def generate_caption(image_path, models):
+    image = Image.open(image_path).convert("RGB").resize((384, 384))
+
+    captions = {}
+
+    # BLIP
+    blip_proc, blip_model = models["blip"]
+    inputs = blip_proc(image, return_tensors="pt").to(device)
+    out = blip_model.generate(**inputs)
+    captions["BLIP"] = blip_proc.decode(out[0], skip_special_tokens=True)
+
+    # BLIP-2
+    blip2_proc, blip2_model = models["blip2"]
+    inputs = blip2_proc(images=image, return_tensors="pt").to(device)
+    out = blip2_model.generate(**inputs, max_new_tokens=30)
+    captions["BLIP-2"] = blip2_proc.tokenizer.decode(out[0], skip_special_tokens=True)
+
+    # ViT-GPT2
+    vit_proc, vit_tok, vit_model = models["vit"]
+    pixel_values = vit_proc(images=image, return_tensors="pt").pixel_values.to(device)
+    output_ids = vit_model.generate(pixel_values, max_length=16, num_beams=4)
+    captions["ViT-GPT2"] = vit_tok.decode(output_ids[0], skip_special_tokens=True)
+
+    # Git
+    git_proc, git_model = models["git"]
+    pixel_values = git_proc(images=image, return_tensors="pt").pixel_values.to(device)
+    output = git_model.generate(pixel_values=pixel_values, max_length=50)
+    captions["GIT"] = git_proc.tokenizer.decode(output[0], skip_special_tokens=True)
+
+    return captions
+
+def load_translation_model():
+    tokenizer = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-ar")
+    model = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-ar").to(device)
+    return tokenizer, model
+
+def translate_to_arabic(text, tokenizer, model):
+    inputs = tokenizer(text, return_tensors="pt", padding=True).to(device)
+    translated = model.generate(**inputs)
+    return tokenizer.decode(translated[0], skip_special_tokens=True)
+
+def clear_memory():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+def main():
+    print("Upload an image...")
+    uploaded = files.upload()
+    if not uploaded:
+        print("No file uploaded.")
+        return
+
+    image_path = list(uploaded.keys())[0]
+    print("Loading models...")
+    models = load_models()
+
+    print("Generating captions using 4 algorithms...")
+    captions = generate_caption(image_path, models)
+
+    print("Loading translation model...")
+    tok, trans_model = load_translation_model()
+
+    print("\n=== Captions ===")
+    for model_name, caption in captions.items():
+        arabic = translate_to_arabic(caption, tok, trans_model)
+        print(f"\n🔹 {model_name} Caption:")
+        print("English:", caption)
+        print("Arabic :", arabic)
+
+    clear_memory()
+
+main()
